@@ -208,19 +208,28 @@ def BoundedModelCheckingOp : VerifOp<"bmc", [
     which clock should be toggled next. The types yielded should be the same,
     as this region yields the updated clock and state values (this should also
     match the types yielded by the `init` region).
+
+    The optional `properties` region holds temporal properties that relate
+    circuit values across timesteps and therefore cannot live inside the
+    per-timestep `circuit` region. Its block arguments are 'leaf' values
+    that the `circuit` region yields between its outputs and its register
+    next-state values. The region contains property expression trees (e.g.
+    LTL ops) over these leaves along with the `verif` ops asserting them; it
+    yields nothing.
   }];
 
   // TODO: initial values should eventually be handled by init region
   let arguments = (ins I32Attr:$bound, I32Attr:$num_regs, ArrayAttr:$initial_values);
   let regions = (region SizedRegion<1>:$init,
                         SizedRegion<1>:$loop,
-                        SizedRegion<1>:$circuit);
+                        SizedRegion<1>:$circuit,
+                        AnyRegion:$props);
 
   let results = (outs I1:$result);
 
   let assemblyFormat = [{
     `bound` $bound `num_regs` $num_regs `initial_values` $initial_values attr-dict-with-keyword `init` $init `loop` $loop `circuit`
-    $circuit
+    $circuit (`properties` $props^)?
   }];
 
   let hasRegionVerifier = true;

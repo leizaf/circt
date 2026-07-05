@@ -299,6 +299,21 @@ LogicalResult BoundedModelCheckingOp::verifyRegions() {
       return emitOpError()
              << "initial values must be integer or unit attributes";
   }
+  if (!getProps().empty()) {
+    TypeRange leafTypes = getProps().getArgumentTypes();
+    auto circuitYieldTy =
+        getCircuit().front().getTerminator()->getOperandTypes();
+    if (circuitYieldTy.size() < getNumRegs() + leafTypes.size())
+      return emitOpError() << "circuit region must yield a leaf value for "
+                              "each properties region leaf argument";
+    if (TypeRange(circuitYieldTy)
+            .drop_back(getNumRegs())
+            .take_back(leafTypes.size()) != leafTypes)
+      return emitOpError()
+             << "properties region leaf argument types must match the "
+                "circuit region's yielded leaf types (yielded between "
+                "outputs and register next-state values)";
+  }
   return success();
 }
 

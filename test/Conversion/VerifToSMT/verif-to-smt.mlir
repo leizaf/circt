@@ -126,6 +126,7 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 // CHECK:      [[TRUE:%.+]] = arith.constant true
 // CHECK:      [[FOR:%.+]]:7 = scf.for [[ARG0:%.+]] = [[C0_I32]] to [[C10_I32]] step [[C1_I32]] iter_args([[ARG1:%.+]] = [[INIT]]#0, [[ARG2:%.+]] = [[F0]], [[ARG3:%.+]] = [[F1]], [[ARG4:%.+]] = [[C42_BV32]], [[ARG5:%.+]] = [[ARRAYFUN]], [[ARG6:%.+]] = [[INIT]]#1, [[ARG7:%.+]] = [[FALSE]])
 // CHECK-NOT:    scf.if
+// CHECK:        [[LOOP:%.+]]:2 = func.call @bmc_loop([[ARG1]], [[ARG6]])
 // CHECK:        [[CIRCUIT:%.+]]:4 = func.call @bmc_circuit([[ARG1]], [[ARG2]], [[ARG3]], [[ARG4]], [[ARG5]])
 // CHECK:        [[SMTCHECK:%.+]] = smt.check sat {
 // CHECK:          smt.yield [[TRUE]]
@@ -136,7 +137,6 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 // CHECK:        }
 // CHECK:        [[ORI:%.+]] = arith.ori [[SMTCHECK]], [[ARG7]]
 // CHECK:        smt.pop 1
-// CHECK:        [[LOOP:%.+]]:2 = func.call @bmc_loop([[ARG1]], [[ARG6]])
 // CHECK:        [[F2:%.+]] = smt.declare_fun "input_1" : !smt.bv<32>
 // CHECK:        [[OLDCLOCKLOW:%.+]] = smt.bv.not [[ARG1]]
 // CHECK:        [[BVPOSEDGE:%.+]] = smt.bv.and [[OLDCLOCKLOW]], [[LOOP]]#0
@@ -186,10 +186,10 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 
 // RUN: circt-opt %s --convert-verif-to-smt="rising-clocks-only=true" --reconcile-unrealized-casts -allow-unregistered-dialect | FileCheck %s --check-prefix=CHECK1
 // CHECK1-LABEL:  func.func @test_bmc() -> i1 {
+// CHECK1:        [[LOOP:%.+]]:2 = func.call @bmc_loop({{%.*}}, {{%.*}})
 // CHECK1:        [[CIRCUIT:%.+]]:4 = func.call @bmc_circuit(
 // CHECK1:        [[SMTCHECK:%.+]] = smt.check
 // CHECK1:        [[ORI:%.+]] = arith.ori [[SMTCHECK]], {{%.*}}
-// CHECK1:        [[LOOP:%.+]]:2 = func.call @bmc_loop({{%.*}}, {{%.*}})
 // CHECK1:        [[F:%.+]] = smt.declare_fun "input_1" : !smt.bv<32>
 // CHECK1:        scf.yield [[LOOP]]#0, [[F]], [[CIRCUIT]]#1, [[CIRCUIT]]#2, [[CIRCUIT]]#3, [[LOOP]]#1, [[ORI]]
 
