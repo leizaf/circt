@@ -8,8 +8,11 @@
 // CHECK:    ^bb0([[ARG0:%.+]]: i32, [[ARG1:%.+]]: i32):
 // CHECK:      [[OP0:%.+]] = comb.add [[ARG0]], [[ARG1]]
 // CHECK:      [[OP1:%.+]] = comb.icmp eq [[OP0]], [[ARG0]]
-// CHECK:      verif.assert [[OP1]]
-// CHECK:      verif.yield [[OP0]]
+// CHECK-NOT:  verif.assert
+// CHECK:      verif.yield [[OP0]], [[OP1]]
+// CHECK:    } properties {
+// CHECK:    ^bb0([[LEAF:%.+]]: i1):
+// CHECK:      verif.assert [[LEAF]]
 // CHECK:    }
 // CHECK:    [[SSTR_ADDR:%.+]] = llvm.mlir.addressof [[SSTR:@.+]] : !llvm.ptr
 // CHECK:    [[FSTR_ADDR:%.+]] = llvm.mlir.addressof [[FSTR:@.+]] : !llvm.ptr
@@ -19,6 +22,9 @@
 // CHECK:  }
 // CHECK:  llvm.mlir.global private constant [[SSTR]]("Bound reached with no violations!\0A\00") {addr_space = 0 : i32}
 // CHECK:  llvm.mlir.global private constant [[FSTR]]("Assertion can be violated!\0A\00") {addr_space = 0 : i32}
+// The other modules in this file are unreachable from the checked module and
+// are erased.
+// CHECK-NOT: hw.module
 
 // RUN: circt-opt --lower-to-bmc="top-module=comb bound=10 ignore-asserts-until=3" %s | FileCheck %s --check-prefix=CHECKIGNOREUNTIL
 // CHECKIGNOREUNTIL:    {{%.+}} = verif.bmc bound 20 num_regs 0 initial_values [] attributes {ignore_asserts_until = 6 : i32} init {
@@ -49,8 +55,11 @@ hw.module @comb(in %in0: i32, in %in1: i32, out out: i32) attributes {num_regs =
 // CHECK1:    ^bb0([[CLK:%.+]]: !seq.clock, [[ARG1:%.+]]: i32, [[ARG2:%.+]]: i32, [[ARG3:%.+]]: i32):
 // CHECK1:      [[OP0:%.+]] = comb.add [[ARG1]], [[ARG2]]
 // CHECK1:      [[OP2:%.+]] = comb.icmp eq [[OP0]], [[ARG1]]
-// CHECK1:      verif.assert [[OP2]]
-// CHECK1:      verif.yield [[ARG3]], [[OP0]]
+// CHECK1-NOT:  verif.assert
+// CHECK1:      verif.yield [[ARG3]], [[OP2]], [[OP0]]
+// CHECK1:    } properties {
+// CHECK1:    ^bb0([[LEAF:%.+]]: i1):
+// CHECK1:      verif.assert [[LEAF]]
 // CHECK1:    }
 // CHECK1:    [[SSTR_ADDR:%.+]] = llvm.mlir.addressof [[SSTR:@.+]] : !llvm.ptr
 // CHECK1:    [[FSTR_ADDR:%.+]] = llvm.mlir.addressof [[FSTR:@.+]] : !llvm.ptr
@@ -96,8 +105,11 @@ hw.module @seq(in %clk : !seq.clock, in %in0 : i32, in %in1 : i32, in %reg_state
 // CHECK2:    ^bb0([[CLK:%.+]]: !seq.clock, [[ARG1:%.+]]: i32, [[ARG2:%.+]]: i32, [[ARG3:%.+]]: i32):
 // CHECK2:      [[OP0:%.+]] = comb.add [[ARG1]], [[ARG2]]
 // CHECK2:      [[OP2:%.+]] = comb.icmp eq [[OP0]], [[ARG1]]
-// CHECK2:      verif.assert [[OP2]]
-// CHECK2:      verif.yield [[ARG3]], [[OP0]]
+// CHECK2-NOT:  verif.assert
+// CHECK2:      verif.yield [[ARG3]], [[OP2]], [[OP0]]
+// CHECK2:    } properties {
+// CHECK2:    ^bb0([[LEAF:%.+]]: i1):
+// CHECK2:      verif.assert [[LEAF]]
 // CHECK2:    }
 // CHECK2:    [[SSTR_ADDR:%.+]] = llvm.mlir.addressof [[SSTR:@.+]] : !llvm.ptr
 // CHECK2:    [[FSTR_ADDR:%.+]] = llvm.mlir.addressof [[FSTR:@.+]] : !llvm.ptr
@@ -112,4 +124,19 @@ hw.module @nondominance(in %clk : !seq.clock, in %in0 : i32, in %in1 : i32, in %
   %1 = comb.add %in0, %in1 : i32
   verif.assert %0 : i1
   hw.output %reg_state, %1 : i32, i32
+}
+
+// RUN: circt-opt --lower-to-bmc="top-module=nestedAssume bound=10" %s | FileCheck %s --check-prefix=CHECKNESTEDASSUME
+
+// Boolean assumes in instantiated modules are left in place: they convert
+// inside the callee and persist as facts, which is the lifetime they need.
+// CHECKNESTEDASSUME-DAG: hw.module private @assumeHelper
+// CHECKNESTEDASSUME-DAG: verif.assume
+// CHECKNESTEDASSUME-DAG: verif.bmc
+hw.module private @assumeHelper(in %in: i1) {
+  verif.assume %in : i1
+}
+hw.module @nestedAssume(in %in: i1) attributes {num_regs = 0 : i32, initial_values = []} {
+  hw.instance "h" @assumeHelper(in: %in : i1) -> ()
+  verif.assert %in : i1
 }

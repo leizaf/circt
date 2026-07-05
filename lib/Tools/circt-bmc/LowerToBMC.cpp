@@ -23,6 +23,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/LogicalResult.h"
 
 using namespace mlir;
@@ -104,6 +106,72 @@ void LowerToBMCPass::runOnOperation() {
     verif::YieldOp::create(builder, loc, terminator->getOperands());
     terminator->erase();
   }
+
+  // Property ops must live in the top module: they move into the BMC
+  // properties region below, and ops inside instantiated modules cannot be
+  // scoped correctly there. Modules not reachable from the top module play
+  // no part in the check and are erased.
+
+  // Collect the modules reachable from the top module through instances.
+  SymbolTable symbolTable(moduleOp);
+  llvm::SetVector<Operation *> reachable;
+  SmallVector<Operation *> worklist({hwModule});
+  while (!worklist.empty()) {
+    Operation *current = worklist.pop_back_val();
+    if (!reachable.insert(current))
+      continue;
+    current->walk([&](InstanceOp instance) {
+      if (Operation *target = symbolTable.lookup(instance.getModuleName()))
+        worklist.push_back(target);
+    });
+  }
+
+  // Validate the property ops and collect the top module's assert/assume
+  // ops for the properties region.
+  auto isPropertyOp = [](Operation *op) {
+    return isa<verif::AssertOp, verif::AssumeOp, verif::CoverOp,
+               verif::ClockedAssertOp, verif::ClockedAssumeOp,
+               verif::ClockedCoverOp>(op);
+  };
+  SmallVector<Operation *> propertyOps;
+  bool invalid = false;
+  for (Operation *mod : reachable) {
+    mod->walk([&](Operation *op) {
+      if (!isPropertyOp(op))
+        return;
+      if (mod != hwModule) {
+        // Plain boolean assumes are fine in instantiated modules: they
+        // convert inside the callee and persist as facts, which is exactly
+        // the lifetime they need.
+        if (isa<verif::AssumeOp>(op) &&
+            op->getOperand(0).getType().isSignlessInteger(1))
+          return;
+        op->emitError("property ops inside instantiated modules are not "
+                      "supported; run with --flatten-modules");
+        invalid = true;
+        return;
+      }
+      if (!isa<verif::AssertOp, verif::AssumeOp>(op)) {
+        op->emitError("unsupported property operation - only verif.assert "
+                      "and verif.assume are supported");
+        invalid = true;
+        return;
+      }
+      if (!op->getOperand(0).getType().isSignlessInteger(1)) {
+        op->emitError("only boolean properties are supported");
+        invalid = true;
+        return;
+      }
+      propertyOps.push_back(op);
+    });
+  }
+  if (invalid)
+    return signalPassFailure();
+
+  // Erase the unreachable modules.
+  for (auto mod : llvm::make_early_inc_range(moduleOp.getOps<hw::HWModuleOp>()))
+    if (!reachable.contains(mod))
+      mod->erase();
 
   // Double the bound given to the BMC op unless in rising clocks only mode, as
   // a clock cycle involves two negations
@@ -201,6 +269,53 @@ void LowerToBMCPass::runOnOperation() {
   auto moduleName = hwModule.getNameAttr();
   bmcOp.getCircuit().takeBody(hwModule.getBody());
   hwModule->erase();
+
+  // Move the property ops into the properties region; the circuit instead
+  // yields their conditions as 'leaf' values (inserted before the register
+  // next-state values), which become the region's block arguments.
+  if (!propertyOps.empty()) {
+    OpBuilder::InsertionGuard guard(builder);
+    auto &circuitBlock = bmcOp.getCircuit().front();
+    auto *propBlock = builder.createBlock(&bmcOp.getProps());
+
+    auto getEnable = [](Operation *op) {
+      return llvm::TypeSwitch<Operation *, Value>(op)
+          .Case<verif::AssertOp, verif::AssumeOp>(
+              [](auto concreteOp) { return concreteOp.getEnable(); })
+          .Default([](Operation *) { return Value(); });
+    };
+    llvm::SetVector<Value> leaves;
+    for (Operation *propOp : propertyOps) {
+      leaves.insert(propOp->getOperand(0));
+      if (Value enable = getEnable(propOp))
+        leaves.insert(enable);
+    }
+
+    for (Value leaf : leaves)
+      propBlock->addArgument(leaf.getType(), leaf.getLoc());
+
+    for (Operation *propOp : propertyOps)
+      propOp->moveBefore(propBlock, propBlock->end());
+
+    // Rewrite leaf uses within the properties region to the block arguments.
+    for (auto [leaf, arg] : llvm::zip(leaves, propBlock->getArguments())) {
+      Value leafValue = leaf;
+      leafValue.replaceUsesWithIf(arg, [&](OpOperand &use) {
+        return use.getOwner()->getBlock() == propBlock;
+      });
+    }
+
+    builder.setInsertionPointToEnd(propBlock);
+    verif::YieldOp::create(builder, loc);
+
+    // Yield the leaves from the circuit, before the register next-states.
+    auto *circuitYield = circuitBlock.getTerminator();
+    SmallVector<Value> yieldOperands(circuitYield->getOperands());
+    yieldOperands.insert(yieldOperands.end() -
+                             cast<IntegerAttr>(numRegs).getInt(),
+                         leaves.begin(), leaves.end());
+    circuitYield->setOperands(yieldOperands);
+  }
 
   // signal names for counter-example generation.
   {

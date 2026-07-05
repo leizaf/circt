@@ -41,3 +41,21 @@ hw.module @Control(in %clk: !seq.clock) {
   %r = seq.compreg %c1, %clk initial %init : i1
   verif.assert %r : i1
 }
+
+// The assumption lives in an instantiated module and the check runs without
+// flattening: the callee's assume must constrain the trace exactly like a
+// top-level one would.
+//  RUN: circt-bmc %s -b 10 --module NestedAssume --shared-libs=%libz3 --flatten-modules=false | FileCheck %s --check-prefix=NESTEDASSUME
+//  NESTEDASSUME: Bound reached with no violations!
+hw.module private @assumeOne(in %in: i1) {
+  verif.assume %in : i1
+}
+hw.module @NestedAssume(in %clk: !seq.clock, in %in: i1) {
+  %init = seq.initial () {
+    %c1 = hw.constant true
+    seq.yield %c1 : i1
+  } : () -> !seq.immutable<i1>
+  %r = seq.compreg %in, %clk initial %init : i1
+  hw.instance "h" @assumeOne(in: %in : i1) -> ()
+  verif.assert %r : i1
+}

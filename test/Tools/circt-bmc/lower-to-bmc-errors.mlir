@@ -83,3 +83,23 @@ hw.module @testModule(in %in0 : i32) attributes {num_regs = 0 : i32, initial_val
   verif.assert %true : i1
   hw.output
 }
+
+// -----
+
+hw.module private @submodule(in %in : i1) {
+  // expected-error @below {{property ops inside instantiated modules are not supported; run with --flatten-modules}}
+  verif.assert %in : i1
+}
+
+hw.module @testModule(in %in : i1) attributes {num_regs = 0 : i32, initial_values = []} {
+  hw.instance "sub" @submodule(in: %in : i1) -> ()
+  hw.output
+}
+
+// -----
+
+hw.module @testModule(in %in : i1) attributes {num_regs = 0 : i32, initial_values = []} {
+  // expected-error @below {{unsupported property operation - only verif.assert and verif.assume are supported}}
+  verif.cover %in : i1
+  hw.output
+}
