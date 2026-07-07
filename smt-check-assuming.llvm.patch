@@ -1,0 +1,147 @@
+From 8ab102122d9d23043a163e3b9992e77f8154d7e7 Mon Sep 17 00:00:00 2001
+From: leizaf <45155667+leizaf@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 15:41:27 -0700
+Subject: [PATCH] [mlir][smt] Add optional assumption operands to smt.check
+
+---
+ mlir/include/mlir/Dialect/SMT/IR/SMTOps.td | 17 +++++++++++++++++
+ mlir/lib/Dialect/SMT/IR/SMTOps.cpp         | 22 ++++++++++++++++++++++
+ mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp    |  6 ++++++
+ mlir/test/Dialect/SMT/basic.mlir           | 12 ++++++++++++
+ mlir/test/Target/SMTLIB/core-errors.mlir   | 11 +++++++++++
+ 5 files changed, 68 insertions(+)
+
+diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td b/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
+index 99b22e5609c..8bff5f2a38e 100644
+--- a/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
++++ b/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
+@@ -201,17 +201,34 @@ def CheckOp : SMTOp<"check", [
+       smt.yield %c-1_i32 : i32
+     } -> i32
+     ```
++
++    An optional list of boolean assumptions may be provided. The satisfiability
++    of the current set of assertions is then checked under these assumptions,
++    without adding them to the assertion stack; this corresponds to
++    `check-sat-assuming` in SMT-LIB. Note that multiple assumptions are
++    conjoined: the query asks whether the asserted formulas and all assumptions
++    are consistent together.
++
++    Example:
++    ```mlir
++    smt.check assuming(%cond) sat {} unknown {} unsat {}
++    ```
+   }];
+ 
++  let arguments = (ins Variadic<BoolType>:$assumptions);
+   let regions = (region SizedRegion<1>:$satRegion,
+                         SizedRegion<1>:$unknownRegion,
+                         SizedRegion<1>:$unsatRegion);
+   let results = (outs Variadic<AnyType>:$results);
+ 
+   let assemblyFormat = [{
++    `` custom<AssumingOperands>($assumptions, type($assumptions))
+     attr-dict `sat` $satRegion `unknown` $unknownRegion `unsat` $unsatRegion
+     (`->` qualified(type($results))^ )?
+   }];
++  let builders = [OpBuilder<(ins "TypeRange":$results), [{
++    build($_builder, $_state, results, ValueRange());
++  }]>];
+ 
+   let hasRegionVerifier = true;
+ }
+diff --git a/mlir/lib/Dialect/SMT/IR/SMTOps.cpp b/mlir/lib/Dialect/SMT/IR/SMTOps.cpp
+index 06ad4ab51b8..1f7a6b4e85a 100644
+--- a/mlir/lib/Dialect/SMT/IR/SMTOps.cpp
++++ b/mlir/lib/Dialect/SMT/IR/SMTOps.cpp
+@@ -70,6 +70,28 @@ LogicalResult SolverOp::verifyRegions() {
+ // CheckOp
+ //===----------------------------------------------------------------------===//
+ 
++static ParseResult
++parseAssumingOperands(OpAsmParser &parser,
++                      SmallVectorImpl<OpAsmParser::UnresolvedOperand> &operands,
++                      SmallVectorImpl<Type> &types) {
++  if (parser.parseOptionalKeyword("assuming"))
++    return success();
++  if (parser.parseLParen() || parser.parseOperandList(operands) ||
++      parser.parseRParen())
++    return failure();
++  types.assign(operands.size(), BoolType::get(parser.getContext()));
++  return success();
++}
++
++static void printAssumingOperands(OpAsmPrinter &printer, Operation *,
++                                  OperandRange operands, TypeRange) {
++  if (operands.empty())
++    return;
++  printer << " assuming(";
++  llvm::interleaveComma(operands, printer);
++  printer << ")";
++}
++
+ LogicalResult CheckOp::verifyRegions() {
+   if (getSatRegion().front().getTerminator()->getOperands().getTypes() !=
+       getResultTypes())
+diff --git a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
+index 189f766c444..e3e76e80b1b 100644
+--- a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
++++ b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
+@@ -579,6 +579,12 @@ struct StatementVisitor
+     if (op->getNumResults() != 0)
+       return op.emitError() << "must not have any result values";
+ 
++    // TODO: lower non-literal assumptions to fresh guard literals and emit
++    // 'check-sat-assuming'.
++    if (!op.getAssumptions().empty())
++      return op.emitError()
++             << "exporting a check with assumptions is not supported yet";
++
+     if (op.getSatRegion().front().getOperations().size() != 1)
+       return op->emitError() << "'sat' region must be empty";
+     if (op.getUnknownRegion().front().getOperations().size() != 1)
+diff --git a/mlir/test/Dialect/SMT/basic.mlir b/mlir/test/Dialect/SMT/basic.mlir
+index 38d8f4e8d7f..58cfbf96bba 100644
+--- a/mlir/test/Dialect/SMT/basic.mlir
++++ b/mlir/test/Dialect/SMT/basic.mlir
+@@ -81,6 +81,18 @@ func.func @core(%in: i8) {
+   // CHECK-NEXT: }
+   smt.check sat { } unknown { } unsat { }
+ 
++  //      CHECK: smt.check assuming(%{{.*}}, %{{.*}}) sat {
++  // CHECK-NEXT: } unknown {
++  // CHECK-NEXT: } unsat {
++  // CHECK-NEXT: }
++  smt.check assuming(%a, %a) sat { } unknown { } unsat { }
++
++  //      CHECK: smt.check assuming(%{{.*}}) {smt.some_attr} sat {
++  // CHECK-NEXT: } unknown {
++  // CHECK-NEXT: } unsat {
++  // CHECK-NEXT: }
++  smt.check assuming(%a) {smt.some_attr} sat { } unknown { } unsat { }
++
+   // CHECK: %{{.*}} = smt.eq %{{.*}}, %{{.*}} {smt.some_attr} : !smt.bv<32>
+   %1 = smt.eq %b, %b {smt.some_attr} : !smt.bv<32>
+   // CHECK: %{{.*}} = smt.distinct %{{.*}}, %{{.*}} {smt.some_attr} : !smt.bv<32>
+diff --git a/mlir/test/Target/SMTLIB/core-errors.mlir b/mlir/test/Target/SMTLIB/core-errors.mlir
+index 691b4380da4..347c36a99c3 100644
+--- a/mlir/test/Target/SMTLIB/core-errors.mlir
++++ b/mlir/test/Target/SMTLIB/core-errors.mlir
+@@ -81,3 +81,14 @@ smt.solver () : () -> () {
+   // expected-error @below {{uninterpreted sorts with same identifier but different arity found}}
+   %1 = smt.declare_fun : !smt.sort<"uninterpreted0"[!smt.bool]>
+ }
++
++// -----
++
++smt.solver () : () -> () {
++  %0 = smt.constant true
++  // expected-error @below {{exporting a check with assumptions is not supported yet}}
++  smt.check assuming(%0) sat {
++  } unknown {
++  } unsat {
++  }
++}
+-- 
+2.54.0
+
