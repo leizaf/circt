@@ -1,4 +1,4 @@
-From 8ab102122d9d23043a163e3b9992e77f8154d7e7 Mon Sep 17 00:00:00 2001
+From c5dced2eddae7b9f21c715bac10020257cabd6b0 Mon Sep 17 00:00:00 2001
 From: leizaf <45155667+leizaf@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 15:41:27 -0700
 Subject: [PATCH] [mlir][smt] Add optional assumption operands to smt.check
@@ -12,7 +12,7 @@ Subject: [PATCH] [mlir][smt] Add optional assumption operands to smt.check
  5 files changed, 68 insertions(+)
 
 diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td b/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
-index 99b22e5609c..8bff5f2a38e 100644
+index 99b22e5609c..fdf1242c234 100644
 --- a/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
 +++ b/mlir/include/mlir/Dialect/SMT/IR/SMTOps.td
 @@ -201,17 +201,34 @@ def CheckOp : SMTOp<"check", [
@@ -22,10 +22,10 @@ index 99b22e5609c..8bff5f2a38e 100644
 +
 +    An optional list of boolean assumptions may be provided. The satisfiability
 +    of the current set of assertions is then checked under these assumptions,
-+    without adding them to the assertion stack; this corresponds to
-+    `check-sat-assuming` in SMT-LIB. Note that multiple assumptions are
++    without adding them to the assertion stack. Multiple assumptions are
 +    conjoined: the query asks whether the asserted formulas and all assumptions
-+    are consistent together.
++    are consistent together. Exporters targeting SMT-LIB `check-sat-assuming`
++    must lower non-literal assumptions to fresh guard literals.
 +
 +    Example:
 +    ```mlir

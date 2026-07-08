@@ -8,6 +8,7 @@
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Debug/DebugOps.h"
+#include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -23,8 +24,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/LogicalResult.h"
 
 using namespace mlir;
@@ -113,18 +114,11 @@ void LowerToBMCPass::runOnOperation() {
   // no part in the check and are erased.
 
   // Collect the modules reachable from the top module through instances.
-  SymbolTable symbolTable(moduleOp);
+  auto &instanceGraph = getAnalysis<hw::InstanceGraph>();
   llvm::SetVector<Operation *> reachable;
-  SmallVector<Operation *> worklist({hwModule});
-  while (!worklist.empty()) {
-    Operation *current = worklist.pop_back_val();
-    if (!reachable.insert(current))
-      continue;
-    current->walk([&](InstanceOp instance) {
-      if (Operation *target = symbolTable.lookup(instance.getModuleName()))
-        worklist.push_back(target);
-    });
-  }
+  for (auto *node :
+       llvm::depth_first(instanceGraph.lookup(hwModule.getModuleNameAttr())))
+    reachable.insert(node->getModule().getOperation());
 
   // Validate the property ops and collect the top module's assert/assume
   // ops for the properties region.
@@ -278,11 +272,8 @@ void LowerToBMCPass::runOnOperation() {
     auto &circuitBlock = bmcOp.getCircuit().front();
     auto *propBlock = builder.createBlock(&bmcOp.getProps());
 
-    auto getEnable = [](Operation *op) {
-      return llvm::TypeSwitch<Operation *, Value>(op)
-          .Case<verif::AssertOp, verif::AssumeOp>(
-              [](auto concreteOp) { return concreteOp.getEnable(); })
-          .Default([](Operation *) { return Value(); });
+    auto getEnable = [](Operation *op) -> Value {
+      return op->getNumOperands() > 1 ? op->getOperand(1) : Value();
     };
     llvm::SetVector<Value> leaves;
     for (Operation *propOp : propertyOps) {
@@ -298,7 +289,8 @@ void LowerToBMCPass::runOnOperation() {
       propOp->moveBefore(propBlock, propBlock->end());
 
     // Rewrite leaf uses within the properties region to the block arguments.
-    for (auto [leaf, arg] : llvm::zip(leaves, propBlock->getArguments())) {
+    for (auto [leaf, arg] :
+         llvm::zip_equal(leaves, propBlock->getArguments())) {
       Value leafValue = leaf;
       leafValue.replaceUsesWithIf(arg, [&](OpOperand &use) {
         return use.getOwner()->getBlock() == propBlock;
@@ -311,9 +303,8 @@ void LowerToBMCPass::runOnOperation() {
     // Yield the leaves from the circuit, before the register next-states.
     auto *circuitYield = circuitBlock.getTerminator();
     SmallVector<Value> yieldOperands(circuitYield->getOperands());
-    yieldOperands.insert(yieldOperands.end() -
-                             cast<IntegerAttr>(numRegs).getInt(),
-                         leaves.begin(), leaves.end());
+    yieldOperands.insert(yieldOperands.end() - numRegs.getInt(), leaves.begin(),
+                         leaves.end());
     circuitYield->setOperands(yieldOperands);
   }
 

@@ -300,6 +300,17 @@ LogicalResult BoundedModelCheckingOp::verifyRegions() {
              << "initial values must be integer or unit attributes";
   }
   if (!getProps().empty()) {
+    if (!getProps().hasOneBlock())
+      return emitOpError("properties region must have a single block");
+    for (Operation &propOp : getProps().front()) {
+      if (isa<YieldOp>(propOp))
+        continue;
+      if (!isa<AssertOp, AssumeOp>(propOp))
+        return propOp.emitError(
+            "unsupported operation in the properties region");
+      if (!propOp.getOperand(0).getType().isSignlessInteger(1))
+        return propOp.emitError("only boolean properties are supported");
+    }
     TypeRange leafTypes = getProps().getArgumentTypes();
     auto circuitYieldTy =
         getCircuit().front().getTerminator()->getOperandTypes();
