@@ -43,3 +43,19 @@ properties {
   verif.assert %l : i1
   verif.yield %l : i1
 }
+
+// -----
+
+verif.bmc bound 4 num_regs 0 initial_values []
+init {}
+loop {}
+circuit {
+^bb0(%a: i1, %b: i1):
+  verif.yield %a, %b : i1, i1
+}
+properties {
+^bb0(%l1: i1, %l2: i1):
+  // expected-error @below {{unsupported operation in the properties region}}
+  %p = comb.and %l1, %l2 : i1
+  verif.assert %p : i1
+}
