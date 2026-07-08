@@ -59,3 +59,21 @@ hw.module @NestedAssume(in %clk: !seq.clock, in %in: i1) {
   hw.instance "h" @assumeOne(in: %in : i1) -> ()
   verif.assert %r : i1
 }
+
+// A disabled assumption in an instantiated module imposes no constraint:
+// the violation must still be found.
+//  RUN: circt-bmc %s -b 10 --module DisabledNestedAssume --shared-libs=%libz3 --flatten-modules=false | FileCheck %s --check-prefix=DISABLEDNESTED
+//  DISABLEDNESTED: Assertion can be violated!
+hw.module private @assumeDisabled(in %in: i1) {
+  %false = hw.constant false
+  verif.assume %in if %false : i1
+}
+hw.module @DisabledNestedAssume(in %clk: !seq.clock, in %in: i1) {
+  %init = seq.initial () {
+    %c1 = hw.constant true
+    seq.yield %c1 : i1
+  } : () -> !seq.immutable<i1>
+  %r = seq.compreg %in, %clk initial %init : i1
+  hw.instance "h" @assumeDisabled(in: %in : i1) -> ()
+  verif.assert %r : i1
+}

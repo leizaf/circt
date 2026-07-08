@@ -22,6 +22,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace circt {
@@ -70,49 +71,40 @@ static void attachDebugVariables(
   }
 }
 
-/// Temporary markers used to scope property assertions separately from
-/// assumptions after conversion. They are only ever attached to ops inside
-/// the circuit scope of a verif.bmc op and are consumed (and removed) by this
-/// pass before it finishes; conversions outside BMC circuits are untouched.
-static constexpr StringLiteral kPropertyAttr = "verif.bmc_property";
-static constexpr StringLiteral kCircuitAttr = "verif.bmc_circuit";
-
-/// Returns true if the op lives in the circuit scope of a verif.bmc op:
-/// either still inside the op's circuit region, or inside the circuit
-/// function the BMC conversion split that region into.
-static bool isInBMCCircuit(Operation *op) {
-  for (Region *region = op->getParentRegion(); region;
-       region = region->getParentOp()->getParentRegion()) {
-    Operation *parent = region->getParentOp();
-    if (auto bmcOp = dyn_cast<verif::BoundedModelCheckingOp>(parent))
-      return region == &bmcOp.getCircuit();
-    if (auto funcOp = dyn_cast<func::FuncOp>(parent))
-      return funcOp->hasAttr(kCircuitAttr);
-  }
-  return false;
-}
+//===----------------------------------------------------------------------===//
+// BMC property encoding: the circuit yields 'leaf' values (between its
+// outputs and register next-states) that the properties region receives as
+// block arguments. Assumes become permanent facts asserted inside the
+// circuit function; nothing is ever popped. Asserts are never asserted:
+// each step checks `smt.check assuming(OR of enable && !property)`.
+//===----------------------------------------------------------------------===//
 
 /// Lower a verif::AssertOp operation with an i1 operand to a smt::AssertOp,
-/// negated to check for unsatisfiability.
+/// negated to check for unsatisfiability. An enabled assert can only be
+/// violated while its enable holds: enable && !property.
 struct VerifAssertOpConversion : OpConversionPattern<verif::AssertOp> {
   using OpConversionPattern<verif::AssertOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(verif::AssertOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    bool isProperty = isInBMCCircuit(op);
     Value cond = typeConverter->materializeTargetConversion(
         rewriter, op.getLoc(), smt::BoolType::get(getContext()),
         adaptor.getProperty());
+    if (Value enable = adaptor.getEnable()) {
+      Value enableCond = typeConverter->materializeTargetConversion(
+          rewriter, op.getLoc(), smt::BoolType::get(getContext()), enable);
+      cond = smt::ImpliesOp::create(rewriter, op.getLoc(), enableCond, cond);
+    }
     Value notCond = smt::NotOp::create(rewriter, op.getLoc(), cond);
-    auto assertOp = rewriter.replaceOpWithNewOp<smt::AssertOp>(op, notCond);
-    if (isProperty)
-      assertOp->setAttr(kPropertyAttr, rewriter.getUnitAttr());
+    rewriter.replaceOpWithNewOp<smt::AssertOp>(op, notCond);
     return success();
   }
 };
 
-/// Lower a verif::AssumeOp operation with an i1 operand to a smt::AssertOp
+/// Lower a verif::AssumeOp operation with an i1 operand to a smt::AssertOp.
+/// An enabled assume only constrains while its enable holds:
+/// enable -> property.
 struct VerifAssumeOpConversion : OpConversionPattern<verif::AssumeOp> {
   using OpConversionPattern<verif::AssumeOp>::OpConversionPattern;
 
@@ -122,6 +114,11 @@ struct VerifAssumeOpConversion : OpConversionPattern<verif::AssumeOp> {
     Value cond = typeConverter->materializeTargetConversion(
         rewriter, op.getLoc(), smt::BoolType::get(getContext()),
         adaptor.getProperty());
+    if (Value enable = adaptor.getEnable()) {
+      Value enableCond = typeConverter->materializeTargetConversion(
+          rewriter, op.getLoc(), smt::BoolType::get(getContext()), enable);
+      cond = smt::ImpliesOp::create(rewriter, op.getLoc(), enableCond, cond);
+    }
     rewriter.replaceOpWithNewOp<smt::AssertOp>(op, cond);
     return success();
   }
@@ -424,34 +421,16 @@ struct VerifBoundedModelCheckingOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
 
-    // Properties live in the properties region over 'leaf' values the
-    // circuit yields between its outputs and register next-states. Assumes
-    // are asserted permanently; asserts are checked per step inside the
-    // solver scope. Validation runs before the propertyless shortcut so
-    // unsupported properties (e.g. covers) are rejected instead of
-    // silently dropped.
-    Block *propsBlock = nullptr;
-    unsigned numLeaves = 0;
-    if (!op.getProps().empty()) {
-      propsBlock = &op.getProps().front();
-      numLeaves = propsBlock->getNumArguments();
-      for (Operation &propOp : *propsBlock) {
-        if (isa<verif::YieldOp>(propOp))
-          continue;
-        if (!isa<verif::AssertOp, verif::AssumeOp>(propOp))
-          return propOp.emitError(
-              "unsupported operation in the properties region");
-        if (!isa<BlockArgument>(propOp.getOperand(0)))
-          return propOp.emitError(
-              "properties must be leaf block arguments of the region");
-      }
-    }
+    // Per checkPropertiesRegion (plus isolation and dominance), the region
+    // holds boolean assert/assume ops over its own leaf block arguments.
+    Block *propsBlock =
+        op.getProps().empty() ? nullptr : &op.getProps().front();
+    unsigned numLeaves = propsBlock ? propsBlock->getNumArguments() : 0;
 
     if (std::find(propertylessBMCOps.begin(), propertylessBMCOps.end(), op) !=
         propertylessBMCOps.end()) {
-      // No properties to check, so we don't bother solving, we just return true
-      // (without this we would incorrectly find violations, since the solver
-      // will always return SAT)
+      // Nothing to check; return true directly instead of asking the
+      // solver, which would report SAT.
       Value trueVal =
           arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(true));
       rewriter.replaceOp(op, trueVal);
@@ -486,17 +465,34 @@ struct VerifBoundedModelCheckingOpConversion
     unsigned numRegs = op.getNumRegs();
     auto initialValues = op.getInitialValues();
 
-    // Maps the properties-region leaf arguments to smt.bool terms derived
-    // from the given circuit results (or return operands).
+    // Encodes the requested kind of property ops with the leaf block
+    // arguments bound to this step's circuit values, handing smt.bool
+    // property/enable terms to `encodeProp`.
     bool propEncodingFailed = false;
-    auto mapPropLeaves = [&](OpBuilder &builder, ValueRange circuitVals,
-                             DenseMap<Value, Value> &cache) {
-      if (!numLeaves)
+    auto encodeProps = [&](OpBuilder &builder, ValueRange circuitVals,
+                           bool wantAsserts,
+                           function_ref<void(Value, Value)> encodeProp) {
+      if (!propsBlock)
         return;
       auto leafVals = circuitVals.drop_back(numRegs).take_back(numLeaves);
-      Value trueBV = smt::BVConstantOp::create(builder, loc, 1, 1);
-      for (auto [arg, val] : llvm::zip(propsBlock->getArguments(), leafVals))
-        cache[arg] = smt::EqOp::create(builder, loc, val, trueBV);
+      auto toBool = [&](Value v) -> Value {
+        Value leaf = leafVals[cast<BlockArgument>(v).getArgNumber()];
+        return typeConverter->materializeTargetConversion(
+            builder, loc, smt::BoolType::get(builder.getContext()), leaf);
+      };
+      for (Operation &propOp : *propsBlock) {
+        if (!isa<verif::AssertOp, verif::AssumeOp>(propOp) ||
+            isa<verif::AssertOp>(propOp) != wantAsserts)
+          continue;
+        bool hasEnable = propOp.getNumOperands() > 1;
+        Value property = toBool(propOp.getOperand(0));
+        Value enable = hasEnable ? toBool(propOp.getOperand(1)) : Value();
+        if (!property || (hasEnable && !enable)) {
+          propEncodingFailed = true;
+          continue;
+        }
+        encodeProp(property, enable);
+      }
     };
 
     auto initFuncTy = rewriter.getFunctionType({}, initOutputTy);
@@ -522,7 +518,6 @@ struct VerifBoundedModelCheckingOpConversion
                                   loopFuncOp.end());
       circuitFuncOp = func::FuncOp::create(
           rewriter, loc, names.newName("bmc_circuit"), circuitFuncTy);
-      circuitFuncOp->setAttr(kCircuitAttr, rewriter.getUnitAttr());
       rewriter.inlineRegionBefore(op.getCircuit(),
                                   circuitFuncOp.getFunctionBody(),
                                   circuitFuncOp.end());
@@ -540,32 +535,18 @@ struct VerifBoundedModelCheckingOpConversion
         func::ReturnOp::create(rewriter, loc, toReturn);
       }
 
-      // Encode assumptions inside the circuit function so they are asserted
-      // below the property scope and persist across timesteps.
+      // Assumes become permanent facts inside the circuit function;
+      // nothing is ever popped, so they hold across timesteps.
       if (propsBlock) {
         auto *ret = circuitFuncOp.getBody().front().getTerminator();
         rewriter.setInsertionPoint(ret);
-        DenseMap<Value, Value> cache;
-        mapPropLeaves(rewriter, ret->getOperands(), cache);
-        for (Operation &propOp : *propsBlock) {
-          auto assumeOp = dyn_cast<verif::AssumeOp>(&propOp);
-          if (!assumeOp)
-            continue;
-          Value prop = cache.lookup(assumeOp.getProperty());
-          if (!prop) {
-            propEncodingFailed = true;
-            continue;
-          }
-          if (Value enable = assumeOp.getEnable()) {
-            Value enableCond = cache.lookup(enable);
-            if (!enableCond) {
-              propEncodingFailed = true;
-              continue;
-            }
-            prop = smt::ImpliesOp::create(rewriter, loc, enableCond, prop);
-          }
-          smt::AssertOp::create(rewriter, loc, prop);
-        }
+        encodeProps(rewriter, ret->getOperands(), /*wantAsserts=*/false,
+                    [&](Value property, Value enable) {
+                      if (enable)
+                        property = smt::ImpliesOp::create(rewriter, loc, enable,
+                                                          property);
+                      smt::AssertOp::create(rewriter, loc, property);
+                    });
       }
     }
 
@@ -647,19 +628,6 @@ struct VerifBoundedModelCheckingOpConversion
               builder, loc, oldCircuitInputTy,
               iterArgs.take_front(circuitFuncOp.getNumArguments()), debugNames);
 
-          // Call loop func with the clock values and state args to update
-          // them
-          SmallVector<Value> loopCallInputs;
-          llvm::append_range(
-              loopCallInputs,
-              llvm::map_range(clockIndexes,
-                              [&](int index) { return iterArgs[index]; }));
-          llvm::append_range(loopCallInputs,
-                             iterArgs.drop_back().take_back(numStateArgs));
-          ValueRange loopVals =
-              func::CallOp::create(builder, loc, loopFuncOp, loopCallInputs)
-                  ->getResults();
-
           // Execute the circuit
           ValueRange circuitCallOuts =
               func::CallOp::create(
@@ -667,33 +635,24 @@ struct VerifBoundedModelCheckingOpConversion
                   iterArgs.take_front(circuitFuncOp.getNumArguments()))
                   ->getResults();
 
-          // Encode property assertions for this step; they execute inside
-          // the scope opened by the circuit function and are popped after
-          // the check.
+          // The step's question: the disjunction of the (enabled) assert
+          // violations. Nothing is asserted.
+          Value stepViolation;
           if (propsBlock) {
-            DenseMap<Value, Value> cache;
-            mapPropLeaves(builder, circuitCallOuts, cache);
-            for (Operation &propOp : *propsBlock) {
-              auto assertOp = dyn_cast<verif::AssertOp>(&propOp);
-              if (!assertOp)
-                continue;
-              Value prop = cache.lookup(assertOp.getProperty());
-              if (!prop) {
-                propEncodingFailed = true;
-                continue;
-              }
-              Value violation = smt::NotOp::create(builder, loc, prop);
-              if (Value enable = assertOp.getEnable()) {
-                Value enableCond = cache.lookup(enable);
-                if (!enableCond) {
-                  propEncodingFailed = true;
-                  continue;
-                }
-                violation =
-                    smt::AndOp::create(builder, loc, enableCond, violation);
-              }
-              smt::AssertOp::create(builder, loc, violation);
-            }
+            SmallVector<Value> violations;
+            encodeProps(builder, circuitCallOuts, /*wantAsserts=*/true,
+                        [&](Value property, Value enable) {
+                          Value violation =
+                              smt::NotOp::create(builder, loc, property);
+                          if (enable)
+                            violation = smt::AndOp::create(builder, loc, enable,
+                                                           violation);
+                          violations.push_back(violation);
+                        });
+            if (violations.size() == 1)
+              stepViolation = violations.front();
+            else if (!violations.empty())
+              stepViolation = smt::OrOp::create(builder, loc, violations);
           }
 
           // If we have a cycle up to which we ignore assertions, we need an
@@ -725,8 +684,11 @@ struct VerifBoundedModelCheckingOpConversion
             yieldedValue = ifShouldIgnore.getResult(0);
           }
 
-          auto checkOp =
-              smt::CheckOp::create(rewriter, loc, builder.getI1Type());
+          SmallVector<Value> checkAssumptions;
+          if (stepViolation)
+            checkAssumptions.push_back(stepViolation);
+          auto checkOp = smt::CheckOp::create(
+              rewriter, loc, builder.getI1Type(), checkAssumptions);
           {
             OpBuilder::InsertionGuard guard(builder);
             builder.createBlock(&checkOp.getSatRegion());
@@ -751,10 +713,18 @@ struct VerifBoundedModelCheckingOpConversion
           // If we created an IfOp, make sure we start inserting after it again
           builder.restoreInsertionPoint(insideForPoint);
 
-          // Discard this step's property assertions (scoped by the push at
-          // the end of the circuit function); assumptions were asserted
-          // before that push and persist across steps.
-          smt::PopOp::create(builder, loc, 1);
+          // Update clock and state values; runs after the check so loop
+          // effects cannot constrain the current step's query.
+          SmallVector<Value> loopCallInputs;
+          llvm::append_range(loopCallInputs,
+                             llvm::map_range(clockIndexes, [&](int index) {
+                               return iterArgs[index];
+                             }));
+          llvm::append_range(loopCallInputs,
+                             iterArgs.drop_back().take_back(numStateArgs));
+          ValueRange loopVals =
+              func::CallOp::create(builder, loc, loopFuncOp, loopCallInputs)
+                  ->getResults();
 
           size_t loopIndex = 0;
           // Collect decls to yield at end of iteration
@@ -865,6 +835,146 @@ void circt::populateVerifToSMTConversionPatterns(
       propertylessBMCOps);
 }
 
+//===----------------------------------------------------------------------===//
+// BMC validation
+//===----------------------------------------------------------------------===//
+
+/// Initial values are only supported on integer-typed registers.
+static LogicalResult
+checkRegisterInitialValues(verif::BoundedModelCheckingOp bmcOp) {
+  auto regTypes = TypeRange(bmcOp.getCircuit().getArgumentTypes())
+                      .take_back(bmcOp.getNumRegs());
+  for (auto [regType, initVal] :
+       llvm::zip(regTypes, bmcOp.getInitialValues())) {
+    if (isa<UnitAttr>(initVal))
+      continue;
+    if (!isa<IntegerType>(regType))
+      return bmcOp.emitError("initial values are currently only supported "
+                             "for registers with integer types");
+    auto tyAttr = dyn_cast<TypedAttr>(initVal);
+    if (!tyAttr || tyAttr.getType() != regType)
+      return bmcOp.emitError("type of initial value does not match type of "
+                             "initialized register");
+  }
+  return success();
+}
+
+/// The BMC unrolling supports at most one clock.
+/// TODO: remove once reg ins/outs can be associated with clocks.
+static LogicalResult checkAtMostOneClock(verif::BoundedModelCheckingOp bmcOp) {
+  int numClocks =
+      llvm::count_if(bmcOp.getCircuit().getArgumentTypes(),
+                     [](Type ty) { return isa<seq::ClockType>(ty); });
+  if (numClocks > 1)
+    return bmcOp.emitError(
+        "only modules with one or zero clocks are currently supported");
+  return success();
+}
+
+/// The properties region holds boolean assert/assume ops directly over its
+/// leaf block arguments; richer expressions belong in the circuit, yielded
+/// as leaves.
+static LogicalResult
+checkPropertiesRegion(verif::BoundedModelCheckingOp bmcOp) {
+  if (bmcOp.getProps().empty())
+    return success();
+  if (!bmcOp.getProps().hasOneBlock())
+    return bmcOp.emitError("properties region must have a single block");
+  for (Operation &propOp : bmcOp.getProps().front()) {
+    if (isa<verif::YieldOp>(propOp))
+      continue;
+    if (!isa<verif::AssertOp, verif::AssumeOp>(propOp))
+      return propOp.emitError("unsupported operation in the properties region");
+    if (!propOp.getOperand(0).getType().isSignlessInteger(1))
+      return propOp.emitError("only boolean properties are supported");
+  }
+  return success();
+}
+
+/// Asserts outside the properties region would convert into permanent
+/// facts and mask later violations; assumes are fine anywhere, since
+/// persisting is exactly the lifetime facts need.
+static LogicalResult
+checkNoMisplacedPropertyOps(verif::BoundedModelCheckingOp bmcOp,
+                            SymbolTable &symbolTable) {
+  // Unsupported property ops in the op's own regions would otherwise be
+  // silently erased by the propertyless shortcut.
+  bool invalid = false;
+  for (Region *region :
+       {&bmcOp.getCircuit(), &bmcOp.getInit(), &bmcOp.getLoop()})
+    region->walk([&](Operation *op) {
+      if (isa<verif::AssertOp>(op)) {
+        op->emitError("assertions are not supported inside the circuit, "
+                      "init, or loop regions of a verif.bmc op - they must "
+                      "live in the op's properties region (the circt-bmc "
+                      "pipeline moves them there)");
+        invalid = true;
+      } else if (isa<verif::CoverOp, verif::ClockedAssertOp,
+                     verif::ClockedAssumeOp, verif::ClockedCoverOp>(op)) {
+        op->emitError("unsupported property operation inside a verif.bmc "
+                      "region - only boolean verif.assume is supported here");
+        invalid = true;
+      }
+    });
+  if (invalid)
+    return failure();
+
+  // Reject asserts in functions and modules reachable through calls and
+  // instances.
+  SetVector<Operation *> reachable;
+  auto enqueueCallees = [&](auto &&root) {
+    root.walk([&](Operation *op) {
+      Operation *callee = nullptr;
+      if (auto inst = dyn_cast<InstanceOp>(op))
+        callee = symbolTable.lookup(inst.getModuleName());
+      else if (auto call = dyn_cast<func::CallOp>(op))
+        callee = symbolTable.lookup(call.getCallee());
+      if (callee)
+        reachable.insert(callee);
+    });
+  };
+  for (Region *region :
+       {&bmcOp.getCircuit(), &bmcOp.getInit(), &bmcOp.getLoop()})
+    enqueueCallees(*region);
+  for (unsigned i = 0; i < reachable.size(); ++i)
+    enqueueCallees(*reachable[i]);
+  for (Operation *callee : reachable) {
+    bool hasAssert = false;
+    callee->walk([&](verif::AssertOp) { hasAssert = true; });
+    if (hasAssert)
+      return bmcOp.emitError(
+          "assertions inside instantiated modules or called functions are "
+          "not supported - inline them into the top module first (e.g. with "
+          "--flatten-modules)");
+  }
+  return success();
+}
+
+/// Validates every verif.bmc op and collects the propertyless ones, which
+/// short-circuit to a trivial pass.
+static LogicalResult
+validateBMCOps(ModuleOp module, SymbolTable &symbolTable,
+               SmallVectorImpl<Operation *> &propertylessBMCOps) {
+  WalkResult result = module.walk([&](verif::BoundedModelCheckingOp bmcOp) {
+    if (failed(checkRegisterInitialValues(bmcOp)) ||
+        failed(checkAtMostOneClock(bmcOp)) ||
+        failed(checkPropertiesRegion(bmcOp)) ||
+        failed(checkNoMisplacedPropertyOps(bmcOp, symbolTable)))
+      return WalkResult::interrupt();
+    bool hasAsserts = !bmcOp.getProps().empty() &&
+                      llvm::any_of(bmcOp.getProps().front(), [](Operation &op) {
+                        return isa<verif::AssertOp>(op);
+                      });
+    if (!hasAsserts) {
+      bmcOp.emitWarning("no property provided to check in module - will "
+                        "trivially find no violations.");
+      propertylessBMCOps.push_back(bmcOp);
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
 void ConvertVerifToSMTPass::runOnOperation() {
   ConversionTarget target(getContext());
   target.addIllegalDialect<verif::VerifDialect>();
@@ -879,104 +989,13 @@ void ConvertVerifToSMTPass::runOnOperation() {
         dyn_cast_or_null<verif::BoundedModelCheckingOp>(op->getParentOp());
     return bmcOp && op->getParentRegion() == &bmcOp.getProps();
   };
-  target.addDynamicallyLegalOp<verif::AssertOp, verif::AssumeOp,
-                               verif::CoverOp>(inPropsRegion);
+  target
+      .addDynamicallyLegalOp<verif::AssertOp, verif::AssumeOp, verif::CoverOp>(
+          inPropsRegion);
 
-  // Check BMC ops contain only one assertion (done outside pattern to avoid
-  // issues with whether assertions are/aren't lowered yet)
   SymbolTable symbolTable(getOperation());
   SmallVector<Operation *> propertylessBMCOps;
-  WalkResult assertionCheck = getOperation().walk(
-      [&](Operation *op) { // Check there is exactly one assertion and clock
-        if (auto bmcOp = dyn_cast<verif::BoundedModelCheckingOp>(op)) {
-          // We also currently don't support initial values on registers that
-          // don't have integer inputs.
-          auto regTypes = TypeRange(bmcOp.getCircuit().getArgumentTypes())
-                              .take_back(bmcOp.getNumRegs());
-          for (auto [regType, initVal] :
-               llvm::zip(regTypes, bmcOp.getInitialValues())) {
-            if (!isa<UnitAttr>(initVal)) {
-              if (!isa<IntegerType>(regType)) {
-                op->emitError("initial values are currently only supported for "
-                              "registers with integer types");
-                return WalkResult::interrupt();
-              }
-              auto tyAttr = dyn_cast<TypedAttr>(initVal);
-              if (!tyAttr || tyAttr.getType() != regType) {
-                op->emitError("type of initial value does not match type of "
-                              "initialized register");
-                return WalkResult::interrupt();
-              }
-            }
-          }
-          // Check only one clock is present in the circuit inputs
-          auto numClockArgs = 0;
-          for (auto argType : bmcOp.getCircuit().getArgumentTypes())
-            if (isa<seq::ClockType>(argType))
-              numClockArgs++;
-          // TODO: this can be removed once we have a way to associate reg
-          // ins/outs with clocks
-          if (numClockArgs > 1) {
-            op->emitError(
-                "only modules with one or zero clocks are currently supported");
-            return WalkResult::interrupt();
-          }
-          SmallVector<mlir::Operation *> worklist;
-          int numAssertions = 0;
-          op->walk([&](Operation *curOp) {
-            if (isa<verif::AssertOp>(curOp))
-              numAssertions++;
-            if (auto inst = dyn_cast<InstanceOp>(curOp))
-              worklist.push_back(symbolTable.lookup(inst.getModuleName()));
-            if (auto func = dyn_cast<func::CallOp>(curOp))
-              worklist.push_back(symbolTable.lookup(func.getCallee()));
-          });
-          // Assertions inside instantiated modules or called functions
-          // convert inside the callee's body, outside the circuit function's
-          // per-step property scope: their negated conditions would be
-          // asserted permanently and mask later violations (a silent false
-          // pass). Reject them instead. Assumptions are fine: persisting is
-          // exactly the lifetime they need.
-          // TODO: probably negligible compared to actual model checking time
-          // but cacheing the assertion count of modules would speed this up
-          int numNestedAssertions = 0;
-          while (!worklist.empty()) {
-            auto *module = worklist.pop_back_val();
-            module->walk([&](Operation *curOp) {
-              if (isa<verif::AssertOp>(curOp))
-                numNestedAssertions++;
-              if (auto inst = dyn_cast<InstanceOp>(curOp))
-                worklist.push_back(symbolTable.lookup(inst.getModuleName()));
-              if (auto func = dyn_cast<func::CallOp>(curOp))
-                worklist.push_back(symbolTable.lookup(func.getCallee()));
-            });
-            if (numNestedAssertions > 0)
-              break;
-          }
-          if (numNestedAssertions > 0) {
-            op->emitError(
-                "assertions inside instantiated modules or called functions "
-                "are not supported - inline them into the top module first "
-                "(e.g. with --flatten-modules)");
-            return WalkResult::interrupt();
-          }
-          if (numAssertions == 0) {
-            op->emitWarning("no property provided to check in module - will "
-                            "trivially find no violations.");
-            propertylessBMCOps.push_back(bmcOp);
-          }
-          if (numAssertions > 1) {
-            op->emitError(
-                "bounded model checking problems with multiple assertions are "
-                "not yet "
-                "correctly handled - instead, you can assert the "
-                "conjunction of your assertions");
-            return WalkResult::interrupt();
-          }
-        }
-        return WalkResult::advance();
-      });
-  if (assertionCheck.wasInterrupted())
+  if (failed(validateBMCOps(getOperation(), symbolTable, propertylessBMCOps)))
     return signalPassFailure();
   RewritePatternSet patterns(&getContext());
   TypeConverter converter;
@@ -993,27 +1012,4 @@ void ConvertVerifToSMTPass::runOnOperation() {
   if (failed(mlir::applyPartialConversion(getOperation(), target,
                                           std::move(patterns))))
     return signalPassFailure();
-
-  // Sink property assertions in each BMC circuit function past a push, so the
-  // caller's pop after smt.check discards only them; assumptions and
-  // definitions above the push persist across timesteps. Property markers are
-  // only ever attached inside circuit scopes, so no other functions need
-  // visiting.
-  for (auto funcOp : getOperation().getOps<func::FuncOp>()) {
-    if (!funcOp->hasAttr(kCircuitAttr))
-      continue;
-    funcOp->removeAttr(kCircuitAttr);
-    SmallVector<Operation *> properties;
-    funcOp.walk([&](smt::AssertOp assertOp) {
-      if (assertOp->hasAttr(kPropertyAttr)) {
-        assertOp->removeAttr(kPropertyAttr);
-        properties.push_back(assertOp);
-      }
-    });
-    Operation *terminator = funcOp.getBody().front().getTerminator();
-    OpBuilder builder(terminator);
-    smt::PushOp::create(builder, funcOp.getLoc(), 1);
-    for (Operation *property : properties)
-      property->moveBefore(terminator);
-  }
 }

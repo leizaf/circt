@@ -181,6 +181,27 @@ protected:
     }
     return LLVM::AddressOfOp::create(builder, loc, global);
   }
+
+  /// Store the given values in a stack-allocated array of Z3 AST pointers and
+  /// return a pointer to that array.
+  Value createStorageForValueList(ValueRange values, Location loc,
+                                  ConversionPatternRewriter &rewriter) const {
+    Type ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext());
+    Type arrTy = LLVM::LLVMArrayType::get(ptrTy, values.size());
+    Value constOne =
+        LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(), 1);
+    Value storage =
+        LLVM::AllocaOp::create(rewriter, loc, ptrTy, arrTy, constOne);
+    Value array = LLVM::UndefOp::create(rewriter, loc, arrTy);
+
+    for (auto [i, val] : llvm::enumerate(values))
+      array = LLVM::InsertValueOp::create(rewriter, loc, array, val,
+                                          ArrayRef<int64_t>(i));
+
+    LLVM::StoreOp::create(rewriter, loc, array, storage);
+
+    return storage;
+  }
   /// Most API functions require a pointer to the the Z3 context object as the
   /// first argument. This helper function prepends this pointer value to the
   /// call for convenience.
@@ -828,11 +849,27 @@ struct CheckOpLowering : public SMTLoweringPattern<CheckOp> {
     if (failed(typeConverter->convertTypes(op->getResultTypes(), resultTypes)))
       return failure();
 
-    // Call 'check-sat' and check if the assertions are satisfiable.
-    Value checkResult =
-        buildAPICallWithContext(rewriter, loc, "Z3_solver_check",
-                                rewriter.getI32Type(), {solver})
-            ->getResult(0);
+    // Call 'check-sat' (or 'check-sat-assuming' when assumption operands are
+    // present) and check if the assertions are satisfiable.
+    Value checkResult;
+    if (adaptor.getAssumptions().empty()) {
+      checkResult = buildAPICallWithContext(rewriter, loc, "Z3_solver_check",
+                                            rewriter.getI32Type(), {solver})
+                        ->getResult(0);
+    } else {
+      // Store the assumption terms in a stack-allocated array and call
+      // Z3_solver_check_assumptions(ctx, solver, num, array).
+      Value storage =
+          createStorageForValueList(adaptor.getAssumptions(), loc, rewriter);
+      Value numAssumptions =
+          LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                   adaptor.getAssumptions().size());
+      checkResult =
+          buildAPICallWithContext(rewriter, loc, "Z3_solver_check_assumptions",
+                                  rewriter.getI32Type(),
+                                  {solver, numAssumptions, storage})
+              ->getResult(0);
+    }
     Value constOne =
         LLVM::ConstantOp::create(rewriter, loc, checkResult.getType(), 1);
     Value isSat = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq,
@@ -918,26 +955,8 @@ struct QuantifierLowering : public SMTLoweringPattern<QuantifierOp> {
   using SMTLoweringPattern<QuantifierOp>::SMTLoweringPattern;
   using SMTLoweringPattern<QuantifierOp>::typeConverter;
   using SMTLoweringPattern<QuantifierOp>::buildPtrAPICall;
+  using SMTLoweringPattern<QuantifierOp>::createStorageForValueList;
   using OpAdaptor = typename QuantifierOp::Adaptor;
-
-  Value createStorageForValueList(ValueRange values, Location loc,
-                                  ConversionPatternRewriter &rewriter) const {
-    Type ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext());
-    Type arrTy = LLVM::LLVMArrayType::get(ptrTy, values.size());
-    Value constOne =
-        LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(), 1);
-    Value storage =
-        LLVM::AllocaOp::create(rewriter, loc, ptrTy, arrTy, constOne);
-    Value array = LLVM::UndefOp::create(rewriter, loc, arrTy);
-
-    for (auto [i, val] : llvm::enumerate(values))
-      array = LLVM::InsertValueOp::create(rewriter, loc, array, val,
-                                          ArrayRef<int64_t>(i));
-
-    LLVM::StoreOp::create(rewriter, loc, array, storage);
-
-    return storage;
-  }
 
   LogicalResult
   matchAndRewrite(QuantifierOp op, OpAdaptor adaptor,

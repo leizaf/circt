@@ -472,3 +472,21 @@ func.func @test_logic() {
   }
   func.return
 }
+
+// CHECK-LABEL: llvm.func @solver_3
+func.func @test_check_assuming() {
+  smt.solver () : () -> () {
+    // CHECK: [[TRUE:%.+]] = llvm.call @Z3_mk_true
+    %true = smt.constant true
+    // CHECK: [[C1:%.+]] = llvm.mlir.constant(1 : i32) : i32
+    // CHECK: [[STORAGE:%.+]] = llvm.alloca [[C1]] x !llvm.array<1 x ptr>
+    // CHECK: [[A0:%.+]] = llvm.mlir.undef : !llvm.array<1 x ptr>
+    // CHECK: [[A1:%.+]] = llvm.insertvalue [[TRUE]], [[A0]][0] : !llvm.array<1 x ptr>
+    // CHECK: llvm.store [[A1]], [[STORAGE]]
+    // CHECK: [[NUM:%.+]] = llvm.mlir.constant(1 : i32) : i32
+    // CHECK: llvm.call @Z3_solver_check_assumptions({{.*}}, {{.*}}, [[NUM]], [[STORAGE]]) : (!llvm.ptr, !llvm.ptr, i32, !llvm.ptr) -> i32
+    smt.check assuming(%true) sat {} unknown {} unsat {}
+    smt.yield
+  }
+  func.return
+}

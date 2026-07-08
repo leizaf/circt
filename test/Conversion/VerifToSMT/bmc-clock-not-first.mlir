@@ -24,12 +24,15 @@ func.func @test_bmc_clock_not_first() -> (i1) {
   ^bb0(%arg0: i32, %clk: !seq.clock, %state0: i32):
     // dummy property
     %true = hw.constant true
-    verif.assert %true : i1
     %c-1_i32 = hw.constant -1 : i32
     %0 = comb.add %arg0, %state0 : i32
     // %state0 is the result of a seq.compreg taking %0 as input
     %2 = comb.xor %state0, %c-1_i32 : i32
-    verif.yield %2, %0 : i32, i32
+    verif.yield %2, %true, %0 : i32, i1, i32
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }

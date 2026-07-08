@@ -25,6 +25,33 @@ func.func @lower_assume(%arg0: i1) {
   return
 }
 
+// An enabled assert can only be violated while enabled: not(enable -> prop).
+// CHECK: func.func @lower_assert_enabled([[ARG0:%.+]]: i1, [[EN:%.+]]: i1)
+// CHECK:   [[P:%.+]] = smt.eq
+// CHECK:   [[E:%.+]] = smt.eq
+// CHECK:   [[IMP:%.+]] = smt.implies [[E]], [[P]]
+// CHECK:   [[NEG:%.+]] = smt.not [[IMP]]
+// CHECK:   smt.assert [[NEG]]
+// CHECK:   return
+
+func.func @lower_assert_enabled(%arg0: i1, %en: i1) {
+  verif.assert %arg0 if %en : i1
+  return
+}
+
+// An enabled assume only constrains while enabled: enable -> prop.
+// CHECK: func.func @lower_assume_enabled([[ARG0:%.+]]: i1, [[EN:%.+]]: i1)
+// CHECK:   [[P:%.+]] = smt.eq
+// CHECK:   [[E:%.+]] = smt.eq
+// CHECK:   [[IMP:%.+]] = smt.implies [[E]], [[P]]
+// CHECK:   smt.assert [[IMP]]
+// CHECK:   return
+
+func.func @lower_assume_enabled(%arg0: i1, %en: i1) {
+  verif.assume %arg0 if %en : i1
+  return
+}
+
 // CHECK-LABEL: func @test_lec
 // CHECK-SAME:  ([[ARG0:%.+]]: !smt.bv<1>)
 func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
@@ -126,9 +153,11 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 // CHECK:      [[TRUE:%.+]] = arith.constant true
 // CHECK:      [[FOR:%.+]]:7 = scf.for [[ARG0:%.+]] = [[C0_I32]] to [[C10_I32]] step [[C1_I32]] iter_args([[ARG1:%.+]] = [[INIT]]#0, [[ARG2:%.+]] = [[F0]], [[ARG3:%.+]] = [[F1]], [[ARG4:%.+]] = [[C42_BV32]], [[ARG5:%.+]] = [[ARRAYFUN]], [[ARG6:%.+]] = [[INIT]]#1, [[ARG7:%.+]] = [[FALSE]])
 // CHECK-NOT:    scf.if
-// CHECK:        [[LOOP:%.+]]:2 = func.call @bmc_loop([[ARG1]], [[ARG6]])
-// CHECK:        [[CIRCUIT:%.+]]:4 = func.call @bmc_circuit([[ARG1]], [[ARG2]], [[ARG3]], [[ARG4]], [[ARG5]])
-// CHECK:        [[SMTCHECK:%.+]] = smt.check sat {
+// CHECK:        [[CIRCUIT:%.+]]:5 = func.call @bmc_circuit([[ARG1]], [[ARG2]], [[ARG3]], [[ARG4]], [[ARG5]])
+// CHECK:        [[PROPBVTRUE:%.+]] = smt.bv.constant #smt.bv<-1> : !smt.bv<1>
+// CHECK:        [[LEAF:%.+]] = smt.eq [[CIRCUIT]]#1, [[PROPBVTRUE]]
+// CHECK:        [[VIOL:%.+]] = smt.not [[LEAF]]
+// CHECK:        [[SMTCHECK:%.+]] = smt.check assuming([[VIOL]]) sat {
 // CHECK:          smt.yield [[TRUE]]
 // CHECK:        } unknown {
 // CHECK:          smt.yield [[TRUE]]
@@ -136,15 +165,15 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 // CHECK:          smt.yield [[FALSE]]
 // CHECK:        }
 // CHECK:        [[ORI:%.+]] = arith.ori [[SMTCHECK]], [[ARG7]]
-// CHECK:        smt.pop 1
+// CHECK:        [[LOOP:%.+]]:2 = func.call @bmc_loop([[ARG1]], [[ARG6]])
 // CHECK:        [[F2:%.+]] = smt.declare_fun "input_1" : !smt.bv<32>
 // CHECK:        [[OLDCLOCKLOW:%.+]] = smt.bv.not [[ARG1]]
 // CHECK:        [[BVPOSEDGE:%.+]] = smt.bv.and [[OLDCLOCKLOW]], [[LOOP]]#0
 // CHECK:        [[BVTRUE:%.+]] = smt.bv.constant #smt.bv<-1> : !smt.bv<1>
 // CHECK:        [[BOOLPOSEDGE:%.+]] = smt.eq [[BVPOSEDGE]], [[BVTRUE]]
-// CHECK:        [[NEWREG1:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#1, [[ARG3]]
-// CHECK:        [[NEWREG2:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#2, [[ARG4]]
-// CHECK:        [[NEWREG3:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#3, [[ARG5]]
+// CHECK:        [[NEWREG1:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#2, [[ARG3]]
+// CHECK:        [[NEWREG2:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#3, [[ARG4]]
+// CHECK:        [[NEWREG3:%.+]] = smt.ite [[BOOLPOSEDGE]], [[CIRCUIT]]#4, [[ARG5]]
 // CHECK:        scf.yield [[LOOP]]#0, [[F2]], [[NEWREG1]], [[NEWREG2]], [[NEWREG3]], [[LOOP]]#1, [[ORI]]
 // CHECK:      }
 // CHECK:      [[XORI:%.+]] = arith.xori [[FOR]]#6, [[TRUE]]
@@ -174,24 +203,26 @@ func.func @test_lec(%arg0: !smt.bv<1>) -> (i1, i1, i1) {
 // CHECK:  func.func @bmc_circuit([[ARGO:%.+]]: !smt.bv<1>, [[ARG1:%.+]]: !smt.bv<32>, [[ARG2:%.+]]: !smt.bv<32>, [[ARG3:%.+]]: !smt.bv<32>, [[ARG4:%.+]]: !smt.array<[!smt.bv<1> -> !smt.bv<32>]>)
 // CHECK:    [[C6:%.+]] = builtin.unrealized_conversion_cast [[ARG2]] : !smt.bv<32> to i32
 // CHECK:    [[C7:%.+]] = builtin.unrealized_conversion_cast [[ARG1]] : !smt.bv<32> to i32
+// CHECK:    [[TRUEC:%.+]] = hw.constant true
 // CHECK:    [[CN1_I32:%.+]] = hw.constant -1 : i32
 // CHECK:    [[ADD:%.+]] = comb.add [[C7]], [[C6]]
 // CHECK:    [[XOR:%.+]] = comb.xor [[C6]], [[CN1_I32]]
 // CHECK:    [[C9:%.+]] = builtin.unrealized_conversion_cast [[XOR]] : i32 to !smt.bv<32>
+// CHECK:    [[CT:%.+]] = builtin.unrealized_conversion_cast [[TRUEC]] : i1 to !smt.bv<1>
 // CHECK:    [[C10:%.+]] = builtin.unrealized_conversion_cast [[ADD]] : i32 to !smt.bv<32>
-// CHECK:    smt.push 1
-// CHECK:    smt.assert
-// CHECK:    return [[C9]], [[C10]], [[ARG3]], [[ARG4]]
+// CHECK-NOT: smt.push
+// CHECK-NOT: smt.assert
+// CHECK:    return [[C9]], [[CT]], [[C10]], [[ARG3]], [[ARG4]]
 // CHECK:  }
 
 // RUN: circt-opt %s --convert-verif-to-smt="rising-clocks-only=true" --reconcile-unrealized-casts -allow-unregistered-dialect | FileCheck %s --check-prefix=CHECK1
 // CHECK1-LABEL:  func.func @test_bmc() -> i1 {
-// CHECK1:        [[LOOP:%.+]]:2 = func.call @bmc_loop({{%.*}}, {{%.*}})
-// CHECK1:        [[CIRCUIT:%.+]]:4 = func.call @bmc_circuit(
+// CHECK1:        [[CIRCUIT:%.+]]:5 = func.call @bmc_circuit(
 // CHECK1:        [[SMTCHECK:%.+]] = smt.check
 // CHECK1:        [[ORI:%.+]] = arith.ori [[SMTCHECK]], {{%.*}}
+// CHECK1:        [[LOOP:%.+]]:2 = func.call @bmc_loop({{%.*}}, {{%.*}})
 // CHECK1:        [[F:%.+]] = smt.declare_fun "input_1" : !smt.bv<32>
-// CHECK1:        scf.yield [[LOOP]]#0, [[F]], [[CIRCUIT]]#1, [[CIRCUIT]]#2, [[CIRCUIT]]#3, [[LOOP]]#1, [[ORI]]
+// CHECK1:        scf.yield [[LOOP]]#0, [[F]], [[CIRCUIT]]#2, [[CIRCUIT]]#3, [[CIRCUIT]]#4, [[LOOP]]#1, [[ORI]]
 
 func.func @test_bmc() -> (i1) {
   %bmc = verif.bmc bound 10 num_regs 3 initial_values [unit, 42 : i32, unit]
@@ -212,12 +243,15 @@ func.func @test_bmc() -> (i1) {
   circuit {
   ^bb0(%clk: !seq.clock, %arg0: i32, %state0: i32, %state1: i32, %state2: !hw.array<2xi32>):
     %true = hw.constant true
-    verif.assert %true : i1
     %c-1_i32 = hw.constant -1 : i32
     %0 = comb.add %arg0, %state0 : i32
     // %state0 is the result of a seq.compreg taking %0 as input
     %2 = comb.xor %state0, %c-1_i32 : i32
-    verif.yield %2, %0, %state1, %state2 : i32, i32, i32, !hw.array<2xi32>
+    verif.yield %2, %true, %0, %state1, %state2 : i32, i1, i32, i32, !hw.array<2xi32>
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }
@@ -241,8 +275,11 @@ func.func @large_initial_value() -> (i1) {
   circuit {
   ^bb0(%clk: !seq.clock, %arg0: i65):
     %true = hw.constant true
-    verif.assert %true : i1
-    verif.yield %arg0 : i65
+    verif.yield %true, %arg0 : i1, i65
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }

@@ -8,11 +8,11 @@
 // CHECK: scf.for {{%.+}} iter_args([[CLK_ARG:%.+]] = {{%.+}}, [[INPUT_ARG:%.+]] = [[INPUT_DECL]], [[REG_ARG:%.+]] = [[REG_DECL]], {{%.+}})
 // CHECK: dbg.variable "data_in", [[INPUT_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[REG_ARG]] : !smt.bv<8>
-// CHECK: [[CIRCUIT_RESULT:%.+]] = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>) -> !smt.bv<8>
+// CHECK: [[CIRCUIT_RESULT:%.+]]:2 = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>) -> (!smt.bv<1>, !smt.bv<8>)
 // CHECK-NOT: smt.declare_fun "input_1"
 // CHECK-NOT: smt.declare_fun "reg_0"
 // CHECK: [[NEXT_INPUT_DECL:%.+]] = smt.declare_fun "data_in" : !smt.bv<8>
-// CHECK: [[NEXT_REG:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT]], [[REG_ARG]] : !smt.bv<8>
+// CHECK: [[NEXT_REG:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT]]#1, [[REG_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "data_in", [[NEXT_INPUT_DECL]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[NEXT_REG]] : !smt.bv<8>
 // CHECK: scf.yield {{%.+}}, [[NEXT_INPUT_DECL]], [[NEXT_REG]], {{%.+}} : !smt.bv<1>, !smt.bv<8>, !smt.bv<8>, i1
@@ -33,8 +33,11 @@ func.func @test_bmc_debug_names() -> i1 {
     dbg.variable "data_in", %arg0 scope %scope : i8
     dbg.variable "state_q", %state0 scope %scope : i8
     %true = hw.constant true
-    verif.assert %true : i1
-    verif.yield %arg0 : i8
+    verif.yield %true, %arg0 : i1, i8
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }
@@ -50,10 +53,10 @@ func.func @test_bmc_debug_names() -> i1 {
 // CHECK: dbg.variable "data_in", [[INPUT_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[REG0_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "state_r", [[REG1_ARG]] : !smt.bv<8>
-// CHECK: [[CIRCUIT_RESULT0:%.+]]:2 = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG0_ARG]], [[REG1_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>, !smt.bv<8>) -> (!smt.bv<8>, !smt.bv<8>)
+// CHECK: [[CIRCUIT_RESULT0:%.+]]:3 = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG0_ARG]], [[REG1_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>, !smt.bv<8>) -> (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>)
 // CHECK: [[NEXT_INPUT_DECL:%.+]] = smt.declare_fun "data_in" : !smt.bv<8>
-// CHECK: [[NEXT_REG0:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT0]]#0, [[REG0_ARG]] : !smt.bv<8>
-// CHECK: [[NEXT_REG1:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT0]]#1, [[REG1_ARG]] : !smt.bv<8>
+// CHECK: [[NEXT_REG0:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT0]]#1, [[REG0_ARG]] : !smt.bv<8>
+// CHECK: [[NEXT_REG1:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT0]]#2, [[REG1_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "data_in", [[NEXT_INPUT_DECL]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[NEXT_REG0]] : !smt.bv<8>
 // CHECK: dbg.variable "state_r", [[NEXT_REG1]] : !smt.bv<8>
@@ -79,8 +82,11 @@ func.func @test_bmc_debug_names_extra_loop_state() -> i1 {
     dbg.variable "state_q", %state0 scope %scope : i8
     dbg.variable "state_r", %state1 scope %scope : i8
     %true = hw.constant true
-    verif.assert %true : i1
-    verif.yield %state0, %arg0 : i8, i8
+    verif.yield %true, %state0, %arg0 : i1, i8, i8
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }
@@ -93,9 +99,9 @@ func.func @test_bmc_debug_names_extra_loop_state() -> i1 {
 // CHECK: scf.for {{%.+}} iter_args([[CLK_ARG:%.+]] = {{%.+}}, [[INPUT_ARG:%.+]] = [[INPUT_DECL]], [[REG_ARG:%.+]] = [[REG_CONST]], {{%.+}})
 // CHECK: dbg.variable "data_in", [[INPUT_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[REG_ARG]] : !smt.bv<8>
-// CHECK: [[CIRCUIT_RESULT:%.+]] = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>) -> !smt.bv<8>
+// CHECK: [[CIRCUIT_RESULT:%.+]]:2 = func.call @bmc_circuit{{(_[0-9]+)?}}([[CLK_ARG]], [[INPUT_ARG]], [[REG_ARG]]) : (!smt.bv<1>, !smt.bv<8>, !smt.bv<8>) -> (!smt.bv<1>, !smt.bv<8>)
 // CHECK: [[NEXT_INPUT_DECL:%.+]] = smt.declare_fun "data_in" : !smt.bv<8>
-// CHECK: [[NEXT_REG:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT]], [[REG_ARG]] : !smt.bv<8>
+// CHECK: [[NEXT_REG:%.+]] = smt.ite {{%.+}}, [[CIRCUIT_RESULT]]#1, [[REG_ARG]] : !smt.bv<8>
 // CHECK: dbg.variable "data_in", [[NEXT_INPUT_DECL]] : !smt.bv<8>
 // CHECK: dbg.variable "state_q", [[NEXT_REG]] : !smt.bv<8>
 // CHECK: scf.yield {{%.+}}, [[NEXT_INPUT_DECL]], [[NEXT_REG]], {{%.+}} : !smt.bv<1>, !smt.bv<8>, !smt.bv<8>, i1
@@ -116,8 +122,11 @@ func.func @test_bmc_debug_names_const_init() -> i1 {
     dbg.variable "data_in", %arg0 scope %scope : i8
     dbg.variable "state_q", %state0 scope %scope : i8
     %true = hw.constant true
-    verif.assert %true : i1
-    verif.yield %arg0 : i8
+    verif.yield %true, %arg0 : i1, i8
+  }
+  properties {
+  ^bb0(%leaf: i1):
+    verif.assert %leaf : i1
   }
   func.return %bmc : i1
 }

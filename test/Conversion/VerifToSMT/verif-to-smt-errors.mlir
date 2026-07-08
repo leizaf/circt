@@ -18,8 +18,14 @@ func.func @assert_with_unsupported_property_type(%arg0: !smt.bv<1>) {
 
 // -----
 
-func.func @multiple_assertions_bmc() -> (i1) {
-  // expected-error @below {{bounded model checking problems with multiple assertions are not yet correctly handled - instead, you can assert the conjunction of your assertions}}
+// In-circuit asserts are rejected regardless of count: questions live in
+// the properties region, and an assert converting inside the circuit would
+// become a permanent fact masking later violations. This case used to be
+// the multiple-assertions restriction; any number of asserts is now
+// supported in the properties region (their violations are OR'd into one
+// per-step check, see bmc-properties-bool.mlir and the multi-assert
+// integration test).
+func.func @asserts_in_circuit_bmc() -> (i1) {
   %bmc = verif.bmc bound 10 num_regs 0 initial_values []
   init {}
   loop {}
@@ -27,8 +33,10 @@ func.func @multiple_assertions_bmc() -> (i1) {
   ^bb0(%arg0: i32, %arg1: i32):
     %c1_i32 = hw.constant 1 : i32
     %cond1 = comb.icmp ugt %arg0, %c1_i32 : i32
+    // expected-error @below {{assertions are not supported inside the circuit, init, or loop regions of a verif.bmc op - they must live in the op's properties region (the circt-bmc pipeline moves them there)}}
     verif.assert %cond1 : i1
     %cond2 = comb.icmp ugt %arg1, %c1_i32 : i32
+    // expected-error @below {{assertions are not supported inside the circuit, init, or loop regions of a verif.bmc op - they must live in the op's properties region (the circt-bmc pipeline moves them there)}}
     verif.assert %cond2 : i1
     %sum = comb.add %arg0, %arg1 : i32
     verif.yield %sum : i32
@@ -129,17 +137,16 @@ hw.module @OneAssertion(in %x: i1) {
 
 // -----
 
-// A nested assert is rejected even when accompanied by a top-level assert
-// (which on its own would be fine). The multiple-assertion diagnostic only
-// counts asserts in the top module, so it does not apply here.
+// An in-circuit assert is rejected even when accompanied by a nested one;
+// the in-circuit diagnostic fires first.
 func.func @nested_and_toplevel_assertions() -> (i1) {
-  // expected-error @below {{assertions inside instantiated modules or called functions are not supported - inline them into the top module first (e.g. with --flatten-modules)}}
   %bmc = verif.bmc bound 10 num_regs 0 initial_values []
   init {}
   loop {}
   circuit {
   ^bb0(%arg0: i32, %arg1: i1, %arg2: i1):
     hw.instance "" @OneAssertion(x: %arg1: i1) -> ()
+    // expected-error @below {{assertions are not supported inside the circuit, init, or loop regions of a verif.bmc op - they must live in the op's properties region (the circt-bmc pipeline moves them there)}}
     verif.assert %arg2 : i1
     %sum = comb.add %arg0, %arg0 : i32
     verif.yield %sum : i32
@@ -154,8 +161,7 @@ hw.module @OneAssertion(in %x: i1) {
 // -----
 
 // Two asserts inside one instantiated module hit the nested-assert
-// rejection; the multiple-assertion diagnostic only counts top-module
-// asserts.
+// rejection.
 func.func @nested_asserts_in_one_module() -> (i1) {
   // expected-error @below {{assertions inside instantiated modules or called functions are not supported - inline them into the top module first (e.g. with --flatten-modules)}}
   %bmc = verif.bmc bound 10 num_regs 0 initial_values []
@@ -263,4 +269,61 @@ func.func @refines_non_primitive_free_var() -> () {
     verif.yield %cc : i32
   }
   return
+}
+
+// -----
+
+// Unsupported property ops in the op's own regions are rejected rather than
+// silently erased by the propertyless shortcut.
+func.func @cover_in_circuit_bmc() -> (i1) {
+  %bmc = verif.bmc bound 10 num_regs 0 initial_values []
+  init {}
+  loop {}
+  circuit {
+  ^bb0(%arg0: i1):
+    // expected-error @below {{unsupported property operation inside a verif.bmc region - only boolean verif.assume is supported here}}
+    verif.cover %arg0 : i1
+    verif.yield %arg0 : i1
+  }
+  func.return %bmc : i1
+}
+
+// -----
+
+// Expression trees do not belong in the properties region: compute the
+// expression in the circuit and yield it as a leaf instead.
+func.func @expression_in_props_bmc() -> (i1) {
+  %bmc = verif.bmc bound 10 num_regs 0 initial_values []
+  init {}
+  loop {}
+  circuit {
+  ^bb0(%a: i1, %b: i1):
+    verif.yield %a, %b : i1, i1
+  }
+  properties {
+  ^bb0(%l1: i1, %l2: i1):
+    // expected-error @below {{unsupported operation in the properties region}}
+    %p = comb.and %l1, %l2 : i1
+    verif.assert %p : i1
+  }
+  func.return %bmc : i1
+}
+
+// -----
+
+// Leaves feeding properties must be boolean.
+func.func @ltl_leaf_bmc() -> (i1) {
+  %bmc = verif.bmc bound 10 num_regs 0 initial_values []
+  init {}
+  loop {}
+  circuit {
+  ^bb0(%a: !ltl.property):
+    verif.yield %a : !ltl.property
+  }
+  properties {
+  ^bb0(%l: !ltl.property):
+    // expected-error @below {{only boolean properties are supported}}
+    verif.assert %l : !ltl.property
+  }
+  func.return %bmc : i1
 }
